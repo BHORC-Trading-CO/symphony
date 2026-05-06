@@ -115,21 +115,29 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
+    case settings.tracker.kind do
+      nil -> {:error, :missing_tracker_kind}
+      "linear" -> validate_linear(settings.tracker)
+      "memory" -> :ok
+      "plane" -> validate_plane(settings.tracker)
+      kind -> {:error, {:unsupported_tracker_kind, kind}}
+    end
+  end
+
+  defp validate_linear(tracker) do
     cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
+      not is_binary(tracker.api_key) -> {:error, :missing_linear_api_token}
+      not is_binary(tracker.project_slug) -> {:error, :missing_linear_project_slug}
+      true -> :ok
+    end
+  end
 
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
+  defp validate_plane(tracker) do
+    cond do
+      not is_binary(tracker.api_key) -> {:error, :missing_plane_api_token}
+      not is_binary(tracker.workspace_slug) -> {:error, :missing_plane_workspace_slug}
+      not is_binary(tracker.project_slug) -> {:error, :missing_plane_project_slug}
+      true -> :ok
     end
   end
 
