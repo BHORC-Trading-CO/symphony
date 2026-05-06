@@ -39,8 +39,15 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   def start_session(workspace, opts \\ []) do
     case Keyword.get(opts, :worker_host) do
       nil ->
-        with {:ok, expanded} <- validate_workspace(workspace) do
-          {:ok, %{workspace: expanded, worker_host: nil}}
+        with {:ok, expanded} <- validate_workspace(workspace),
+             {:ok, abs_command, base_args} <- resolve_command() do
+          {:ok,
+           %{
+             workspace: expanded,
+             worker_host: nil,
+             abs_command: abs_command,
+             base_args: base_args
+           }}
         end
 
       _host ->
@@ -50,11 +57,11 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
 
   @impl true
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def run_turn(%{workspace: workspace}, prompt, issue, opts \\ []) do
+  def run_turn(%{workspace: workspace, abs_command: abs_command, base_args: base_args}, prompt, issue, opts \\ []) do
     on_message = Keyword.get(opts, :on_message, fn _ -> :ok end)
     timeout_ms = Keyword.get(opts, :turn_timeout_ms, @default_turn_timeout_ms)
 
-    case open_port(workspace, prompt) do
+    case spawn_port(abs_command, base_args ++ ["-p", prompt], workspace) do
       {:ok, port} ->
         try do
           consume_events(port, on_message, issue, %{}, "", timeout_ms)
@@ -97,16 +104,12 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     end
   end
 
-  defp open_port(workspace, prompt) do
+  defp resolve_command do
     {command, base_args} = command_with_args()
-    args = base_args ++ ["-p", prompt]
 
     case System.find_executable(command) do
-      nil ->
-        {:error, {:claude_code_executable_missing, command}}
-
-      abs_command ->
-        spawn_port(abs_command, args, workspace)
+      nil -> {:error, {:claude_code_executable_missing, command}}
+      abs_command -> {:ok, abs_command, base_args}
     end
   end
 
@@ -204,14 +207,16 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   defp normalize_message(%{"type" => "system", "subtype" => "init", "session_id" => session_id} = event, _issue) do
     {:ok,
      %{
-       kind: :session_started,
+       event: :session_started,
+       timestamp: DateTime.utc_now(),
        session_id: session_id,
        model: Map.get(event, "model"),
-       cwd: Map.get(event, "cwd")
+       cwd: Map.get(event, "cwd"),
+       payload: "session #{session_id} (#{Map.get(event, "model") || "unknown model"})"
      }}
   end
 
-  defp normalize_message(%{"type" => "assistant", "message" => %{"content" => content}}, _issue)
+  defp normalize_message(%{"type" => "assistant", "message" => %{"content" => content} = msg}, _issue)
        when is_list(content) do
     text =
       content
@@ -224,19 +229,27 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
     if text == "" do
       :ignore
     else
-      {:ok, %{kind: :agent_message, text: text}}
+      {:ok,
+       %{
+         event: :assistant_message,
+         timestamp: DateTime.utc_now(),
+         payload: text,
+         usage: Map.get(msg, "usage")
+       }}
     end
   end
 
   defp normalize_message(%{"type" => "result"} = event, _issue) do
     {:ok,
      %{
-       kind: :turn_completed,
+       event: :turn_completed,
+       timestamp: DateTime.utc_now(),
        session_id: Map.get(event, "session_id"),
-       result: Map.get(event, "result"),
+       payload: Map.get(event, "result"),
        is_error: Map.get(event, "is_error", false),
        duration_ms: Map.get(event, "duration_ms"),
-       num_turns: Map.get(event, "num_turns")
+       num_turns: Map.get(event, "num_turns"),
+       usage: Map.get(event, "usage")
      }}
   end
 
