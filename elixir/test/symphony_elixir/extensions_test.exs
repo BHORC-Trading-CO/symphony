@@ -39,6 +39,28 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule FakeAgentAdapter do
+    @behaviour SymphonyElixir.Agent
+
+    @impl true
+    def start_session(workspace, opts) do
+      send(self(), {:fake_agent_start_session, workspace, opts})
+      {:ok, %{workspace: workspace, opts: opts}}
+    end
+
+    @impl true
+    def run_turn(session, prompt, issue, opts) do
+      send(self(), {:fake_agent_run_turn, session, prompt, issue, opts})
+      {:ok, %{session_id: "fake-session-1", thread_id: "fake-thread", turn_id: "fake-turn"}}
+    end
+
+    @impl true
+    def stop_session(session) do
+      send(self(), {:fake_agent_stop_session, session})
+      :ok
+    end
+  end
+
   defmodule SlowOrchestrator do
     use GenServer
 
@@ -317,6 +339,58 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+  end
+
+  test "agent registry resolves built-in adapters, custom overrides, and unknown kinds" do
+    write_workflow_file!(Workflow.workflow_file_path(), [])
+
+    assert SymphonyElixir.Agent.builtin_adapters() == %{"codex" => SymphonyElixir.Codex.AppServer}
+    assert SymphonyElixir.Agent.adapter() == SymphonyElixir.Codex.AppServer
+
+    Application.put_env(:symphony_elixir, :agent_adapters, %{"fake" => FakeAgentAdapter})
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :agent_adapters) end)
+
+    assert SymphonyElixir.Agent.adapter_for!("fake") == FakeAgentAdapter
+    assert SymphonyElixir.Agent.adapter_for!("codex") == SymphonyElixir.Codex.AppServer
+
+    assert_raise ArgumentError, ~r/no agent adapter registered/, fn ->
+      SymphonyElixir.Agent.adapter_for!("missing")
+    end
+  end
+
+  test "agent module delegates start_session/run_turn/stop_session to the configured adapter" do
+    Application.put_env(:symphony_elixir, :agent_adapters, %{"fake" => FakeAgentAdapter})
+    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "fake")
+    issue = %Issue{id: "issue-9", identifier: "AG-9", state: "In Progress"}
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :agent_adapters) end)
+
+    assert SymphonyElixir.Agent.adapter() == FakeAgentAdapter
+
+    # Default-args path (opts omitted).
+    assert {:ok, default_session} = SymphonyElixir.Agent.start_session("/tmp/ws-default")
+    assert_receive {:fake_agent_start_session, "/tmp/ws-default", []}
+
+    assert {:ok, _} = SymphonyElixir.Agent.run_turn(default_session, "p", issue)
+    assert_receive {:fake_agent_run_turn, ^default_session, "p", ^issue, []}
+
+    # Explicit-opts path.
+    assert {:ok, session} = SymphonyElixir.Agent.start_session("/tmp/ws", worker_host: nil)
+    assert_receive {:fake_agent_start_session, "/tmp/ws", worker_host: nil}
+
+    assert {:ok, %{session_id: "fake-session-1"}} =
+             SymphonyElixir.Agent.run_turn(session, "prompt body", issue, on_message: fn _ -> :ok end)
+
+    assert_receive {:fake_agent_run_turn, ^session, "prompt body", ^issue, _opts}
+
+    assert :ok = SymphonyElixir.Agent.stop_session(session)
+    assert_receive {:fake_agent_stop_session, ^session}
+  end
+
+  test "agent module falls back to codex kind when configured kind is empty" do
+    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "")
+    assert SymphonyElixir.Agent.adapter() == SymphonyElixir.Codex.AppServer
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
