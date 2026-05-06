@@ -707,6 +707,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
                  "state" => "In Progress",
+                 "agent_kind" => nil,
                  "worker_host" => nil,
                  "workspace_path" => nil,
                  "session_id" => "thread-http",
@@ -906,7 +907,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Agent update"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"

@@ -27,15 +27,19 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
-    Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
+    agent_kind = Agent.resolve_kind_for_issue(issue)
+
+    Logger.info(
+      "Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)} agent_kind=#{agent_kind}"
+    )
 
     case Workspace.create_for_issue(issue, worker_host) do
       {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace, agent_kind)
 
         try do
           with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, agent_kind)
           end
         after
           Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -60,27 +64,26 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace, agent_kind)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
       {:worker_runtime_info, issue_id,
        %{
          worker_host: worker_host,
-         workspace_path: workspace
+         workspace_path: workspace,
+         agent_kind: agent_kind
        }}
     )
 
     :ok
   end
 
-  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
+  defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace, _agent_kind), do: :ok
 
-  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+  defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host, agent_kind) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-
-    agent_kind = Agent.resolve_kind_for_issue(issue)
 
     with {:ok, session} <-
            Agent.start_session(workspace, worker_host: worker_host, agent_kind: agent_kind) do

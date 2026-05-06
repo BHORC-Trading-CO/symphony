@@ -102,7 +102,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <article class="metric-card">
             <p class="metric-label">Runtime</p>
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
-            <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
+            <p class="metric-detail">Total agent runtime across completed and active sessions.</p>
           </article>
         </section>
 
@@ -144,7 +144,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>State</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
-                    <th>Codex update</th>
+                    <th>Agent update</th>
                     <th>Tokens</th>
                   </tr>
                 </thead>
@@ -153,6 +153,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <span class={agent_badge_class(entry.agent_kind)}>
+                          <%= agent_kind_label(entry.agent_kind) %>
+                        </span>
                         <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
                       </div>
                     </td>
@@ -327,4 +330,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp pretty_value(nil), do: "n/a"
   defp pretty_value(value), do: inspect(value, pretty: true, limit: :infinity)
+
+  defp agent_kind_label(nil), do: "agent: pending"
+  defp agent_kind_label(kind) when is_binary(kind), do: "agent: " <> kind
+  defp agent_kind_label(_kind), do: "agent: pending"
+
+  defp agent_badge_class(kind) do
+    base = "agent-badge"
+    normalized = kind |> to_string() |> String.downcase()
+
+    cond do
+      normalized == "" or is_nil(kind) -> "#{base} agent-badge-pending"
+      String.contains?(normalized, "claude") -> "#{base} agent-badge-claude"
+      String.contains?(normalized, "codex") -> "#{base} agent-badge-codex"
+      true -> "#{base} agent-badge-other"
+    end
+  end
 end

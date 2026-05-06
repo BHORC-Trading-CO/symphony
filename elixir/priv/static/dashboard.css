@@ -393,6 +393,46 @@ pre,
   font-size: 0.86rem;
 }
 
+.agent-badge {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.16rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--card-muted);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1;
+}
+
+.agent-badge-claude {
+  background: #efe9ff;
+  border-color: #d6c8ff;
+  color: #4f378b;
+}
+
+.agent-badge-codex {
+  background: #e6f4ff;
+  border-color: #c0dfff;
+  color: #0b4a8a;
+}
+
+.agent-badge-pending {
+  background: var(--card-muted);
+  border-color: var(--line);
+  color: var(--muted);
+  font-style: italic;
+}
+
+.agent-badge-other {
+  background: #f1f1f1;
+  border-color: #dcdcdc;
+  color: #444;
+}
+
 .muted {
   color: var(--muted);
 }
