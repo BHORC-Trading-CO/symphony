@@ -5,6 +5,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.LiveViewTest
 
   alias SymphonyElixir.Linear.Adapter
+  alias SymphonyElixir.Plane.Adapter, as: PlaneAdapter
+  alias SymphonyElixir.Plane.Client, as: PlaneClient
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
@@ -36,6 +38,33 @@ defmodule SymphonyElixir.ExtensionsTest do
         _ ->
           Process.get({__MODULE__, :graphql_result})
       end
+    end
+  end
+
+  defmodule FakePlaneClient do
+    def fetch_candidate_issues do
+      send(self(), :plane_fetch_candidate_issues_called)
+      {:ok, [:plane_candidate]}
+    end
+
+    def fetch_issues_by_states(states) do
+      send(self(), {:plane_fetch_issues_by_states_called, states})
+      {:ok, states}
+    end
+
+    def fetch_issue_states_by_ids(issue_ids) do
+      send(self(), {:plane_fetch_issue_states_by_ids_called, issue_ids})
+      {:ok, issue_ids}
+    end
+
+    def create_comment(issue_id, body) do
+      send(self(), {:plane_create_comment_called, issue_id, body})
+      :ok
+    end
+
+    def update_issue_state(issue_id, state_name) do
+      send(self(), {:plane_update_issue_state_called, issue_id, state_name})
+      :ok
     end
   end
 
@@ -101,12 +130,19 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
+    plane_client_module = Application.get_env(:symphony_elixir, :plane_client_module)
 
     on_exit(fn ->
       if is_nil(linear_client_module) do
         Application.delete_env(:symphony_elixir, :linear_client_module)
       else
         Application.put_env(:symphony_elixir, :linear_client_module, linear_client_module)
+      end
+
+      if is_nil(plane_client_module) do
+        Application.delete_env(:symphony_elixir, :plane_client_module)
+      else
+        Application.put_env(:symphony_elixir, :plane_client_module, plane_client_module)
       end
     end)
 
@@ -339,6 +375,160 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+  end
+
+  test "tracker dispatches to plane adapter when kind=plane" do
+    Application.put_env(:symphony_elixir, :plane_client_module, FakePlaneClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_endpoint: "https://api.plane.so",
+      tracker_api_token: "plane-token",
+      tracker_workspace_slug: "bhorc",
+      tracker_project_slug: "9f54069d-079b-4f3e-bed6-5c461298a64f"
+    )
+
+    assert SymphonyElixir.Tracker.adapter() == PlaneAdapter
+
+    assert {:ok, [:plane_candidate]} = SymphonyElixir.Tracker.fetch_candidate_issues()
+    assert_receive :plane_fetch_candidate_issues_called
+
+    assert {:ok, ["Ready for dev"]} = SymphonyElixir.Tracker.fetch_issues_by_states(["Ready for dev"])
+    assert_receive {:plane_fetch_issues_by_states_called, ["Ready for dev"]}
+
+    assert {:ok, ["issue-1"]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
+    assert_receive {:plane_fetch_issue_states_by_ids_called, ["issue-1"]}
+
+    assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "hello from symphony")
+    assert_receive {:plane_create_comment_called, "issue-1", "hello from symphony"}
+
+    assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    assert_receive {:plane_update_issue_state_called, "issue-1", "Done"}
+  end
+
+  test "plane config validation requires kind-specific fields" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: nil,
+      tracker_workspace_slug: nil,
+      tracker_project_slug: nil
+    )
+
+    # Missing api_key fails first.
+    assert {:error, :missing_plane_api_token} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: "tok",
+      tracker_workspace_slug: nil,
+      tracker_project_slug: nil
+    )
+
+    assert {:error, :missing_plane_workspace_slug} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: "tok",
+      tracker_workspace_slug: "bhorc",
+      tracker_project_slug: nil
+    )
+
+    assert {:error, :missing_plane_project_slug} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: "tok",
+      tracker_workspace_slug: "bhorc",
+      tracker_project_slug: "proj"
+    )
+
+    assert :ok = Config.validate!()
+  end
+
+  test "plane env var fallbacks resolve PLANE_API_KEY and PLANE_ASSIGNEE" do
+    previous_api_key = System.get_env("PLANE_API_KEY")
+    previous_assignee = System.get_env("PLANE_ASSIGNEE")
+    System.put_env("PLANE_API_KEY", "plane-fallback-key")
+    System.put_env("PLANE_ASSIGNEE", "plane-fallback-assignee")
+
+    on_exit(fn ->
+      restore_env("PLANE_API_KEY", previous_api_key)
+      restore_env("PLANE_ASSIGNEE", previous_assignee)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: nil,
+      tracker_assignee: nil,
+      tracker_workspace_slug: "bhorc",
+      tracker_project_slug: "proj"
+    )
+
+    settings = Config.settings!()
+    assert settings.tracker.api_key == "plane-fallback-key"
+    assert settings.tracker.assignee == "plane-fallback-assignee"
+  end
+
+  test "plane client normalizes a Plane work item into a SymphonyElixir.Issue" do
+    # Configure a minimal plane workflow so Config.settings!() succeeds when
+    # called from inside the normalize helper.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "plane",
+      tracker_api_token: "tok",
+      tracker_workspace_slug: "bhorc",
+      tracker_project_slug: "proj",
+      tracker_assignee: "assignee-uuid-1"
+    )
+
+    payload = %{
+      "id" => "issue-uuid-1",
+      "name" => "Investigate rate limit on buy orders",
+      "description_stripped" => "Some orders are throttled.",
+      "description_html" => "<p>Some orders are throttled.</p>",
+      "priority" => "urgent",
+      "state" => "state-uuid-active",
+      "sequence_id" => 380,
+      "assignees" => ["assignee-uuid-1"],
+      "labels" => ["label-uuid-bug"],
+      "created_at" => "2026-05-05T16:10:49.849847Z",
+      "updated_at" => "2026-05-05T16:12:01.589946Z"
+    }
+
+    issue =
+      PlaneClient.normalize_issue_for_test(
+        payload,
+        %{"state-uuid-active" => "Ready for dev"},
+        %{"label-uuid-bug" => "bug"},
+        "SKINS"
+      )
+
+    assert %Issue{
+             id: "issue-uuid-1",
+             identifier: "SKINS-380",
+             title: "Investigate rate limit on buy orders",
+             description: "Some orders are throttled.",
+             priority: 1,
+             state: "Ready for dev",
+             assignee_id: "assignee-uuid-1",
+             labels: ["bug"],
+             assigned_to_worker: true
+           } = issue
+
+    refute is_nil(issue.created_at)
+    refute is_nil(issue.updated_at)
+
+    # An issue assigned to a different user is not routed to this worker.
+    other_assignee_payload = Map.put(payload, "assignees", ["someone-else"])
+
+    issue_other =
+      PlaneClient.normalize_issue_for_test(
+        other_assignee_payload,
+        %{"state-uuid-active" => "Ready for dev"},
+        %{},
+        "SKINS"
+      )
+
+    refute issue_other.assigned_to_worker
   end
 
   test "agent registry resolves built-in adapters, custom overrides, and unknown kinds" do
