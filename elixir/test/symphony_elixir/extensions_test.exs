@@ -90,6 +90,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule BrokenAgentAdapter do
+    @behaviour SymphonyElixir.Agent
+
+    @impl true
+    def start_session(_workspace, _opts), do: {:error, :start_session_failed}
+
+    @impl true
+    def run_turn(_session, _prompt, _issue, _opts), do: {:error, :run_turn_failed}
+
+    @impl true
+    def stop_session(_session), do: :ok
+  end
+
   defmodule SlowOrchestrator do
     use GenServer
 
@@ -534,7 +547,11 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "agent registry resolves built-in adapters, custom overrides, and unknown kinds" do
     write_workflow_file!(Workflow.workflow_file_path(), [])
 
-    assert SymphonyElixir.Agent.builtin_adapters() == %{"codex" => SymphonyElixir.Codex.AppServer}
+    assert SymphonyElixir.Agent.builtin_adapters() == %{
+             "codex" => SymphonyElixir.Codex.AppServer,
+             "claude_code" => SymphonyElixir.ClaudeCode.AppServer
+           }
+
     assert SymphonyElixir.Agent.adapter() == SymphonyElixir.Codex.AppServer
 
     Application.put_env(:symphony_elixir, :agent_adapters, %{"fake" => FakeAgentAdapter})
@@ -543,6 +560,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert SymphonyElixir.Agent.adapter_for!("fake") == FakeAgentAdapter
     assert SymphonyElixir.Agent.adapter_for!("codex") == SymphonyElixir.Codex.AppServer
+    assert SymphonyElixir.Agent.adapter_for!("claude_code") == SymphonyElixir.ClaudeCode.AppServer
 
     assert_raise ArgumentError, ~r/no agent adapter registered/, fn ->
       SymphonyElixir.Agent.adapter_for!("missing")
@@ -559,28 +577,105 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert SymphonyElixir.Agent.adapter() == FakeAgentAdapter
 
     # Default-args path (opts omitted).
-    assert {:ok, default_session} = SymphonyElixir.Agent.start_session("/tmp/ws-default")
+    assert {:ok, default_wrapped} = SymphonyElixir.Agent.start_session("/tmp/ws-default")
+    assert default_wrapped.__agent_adapter__ == FakeAgentAdapter
+    default_inner = default_wrapped.session
     assert_receive {:fake_agent_start_session, "/tmp/ws-default", []}
 
-    assert {:ok, _} = SymphonyElixir.Agent.run_turn(default_session, "p", issue)
-    assert_receive {:fake_agent_run_turn, ^default_session, "p", ^issue, []}
+    assert {:ok, _} = SymphonyElixir.Agent.run_turn(default_wrapped, "p", issue)
+    assert_receive {:fake_agent_run_turn, ^default_inner, "p", ^issue, []}
 
-    # Explicit-opts path.
-    assert {:ok, session} = SymphonyElixir.Agent.start_session("/tmp/ws", worker_host: nil)
+    # Explicit-opts path. The :agent_kind option is consumed by Agent and not
+    # forwarded to the adapter, while other opts pass through unchanged.
+    assert {:ok, wrapped} = SymphonyElixir.Agent.start_session("/tmp/ws", worker_host: nil, agent_kind: "fake")
+    inner = wrapped.session
     assert_receive {:fake_agent_start_session, "/tmp/ws", worker_host: nil}
 
     assert {:ok, %{session_id: "fake-session-1"}} =
-             SymphonyElixir.Agent.run_turn(session, "prompt body", issue, on_message: fn _ -> :ok end)
+             SymphonyElixir.Agent.run_turn(wrapped, "prompt body", issue, on_message: fn _ -> :ok end)
 
-    assert_receive {:fake_agent_run_turn, ^session, "prompt body", ^issue, _opts}
+    assert_receive {:fake_agent_run_turn, ^inner, "prompt body", ^issue, _opts}
 
-    assert :ok = SymphonyElixir.Agent.stop_session(session)
-    assert_receive {:fake_agent_stop_session, ^session}
+    assert :ok = SymphonyElixir.Agent.stop_session(wrapped)
+    assert_receive {:fake_agent_stop_session, ^inner}
   end
 
   test "agent module falls back to codex kind when configured kind is empty" do
     write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "")
     assert SymphonyElixir.Agent.adapter() == SymphonyElixir.Codex.AppServer
+  end
+
+  test "agent.resolve_kind_for_issue routes by label when configured" do
+    Application.put_env(:symphony_elixir, :agent_adapters, %{"fake" => FakeAgentAdapter})
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :agent_adapters) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_kind: "codex",
+      agent_routing: "by_label"
+    )
+
+    # Label-driven kind takes precedence.
+    issue_claude = %Issue{id: "i-1", identifier: "X-1", labels: ["agent:claude_code"]}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_claude) == "claude_code"
+
+    issue_fake = %Issue{id: "i-2", identifier: "X-2", labels: ["agent:fake", "wip"]}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_fake) == "fake"
+
+    # No agent:* label -> falls back to configured kind.
+    issue_none = %Issue{id: "i-3", identifier: "X-3", labels: ["wip"]}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_none) == "codex"
+
+    # Empty label list also falls back.
+    issue_empty = %Issue{id: "i-4", identifier: "X-4", labels: []}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_empty) == "codex"
+
+    # When routing is fixed, labels are ignored even if present.
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_kind: "codex",
+      agent_routing: "fixed"
+    )
+
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_claude) == "codex"
+
+    # Non-Issue inputs still resolve to configured kind.
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(%{not: :an_issue}) == "codex"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_kind: "codex",
+      agent_routing: "by_label"
+    )
+
+    # Non-binary labels and nil label list both fall back without crashing.
+    issue_nil = %Issue{id: "i-5", identifier: "X-5", labels: nil}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_nil) == "codex"
+
+    issue_atom = %Issue{id: "i-6", identifier: "X-6", labels: [:not_a_string]}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_atom) == "codex"
+
+    # Empty agent: prefix is treated as no match.
+    issue_empty_prefix = %Issue{id: "i-7", identifier: "X-7", labels: ["agent:"]}
+    assert SymphonyElixir.Agent.resolve_kind_for_issue(issue_empty_prefix) == "codex"
+  end
+
+  test "agent.start_session forwards adapter errors and accepts blank agent_kind" do
+    Application.put_env(:symphony_elixir, :agent_adapters, %{
+      "fake" => FakeAgentAdapter,
+      "broken" => BrokenAgentAdapter
+    })
+
+    on_exit(fn -> Application.delete_env(:symphony_elixir, :agent_adapters) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_kind: "fake")
+
+    # Blank kind opt -> falls back to configured default.
+    assert {:ok, wrapped} = SymphonyElixir.Agent.start_session("/tmp/blank-kind", agent_kind: "")
+    assert wrapped.__agent_adapter__ == FakeAgentAdapter
+    assert_receive {:fake_agent_start_session, "/tmp/blank-kind", []}
+
+    # Adapter-level error tuple flows back unchanged (not wrapped).
+    assert {:error, :start_session_failed} =
+             SymphonyElixir.Agent.start_session("/tmp/broken", agent_kind: "broken")
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
