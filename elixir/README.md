@@ -26,23 +26,33 @@ skills can make raw Linear GraphQL calls.
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
+> **BHORC fork notes.** This fork extends upstream Symphony with two adapters
+> registered in addition to the originals: a Plane tracker adapter
+> (`tracker.kind: plane`) and a Claude Code agent adapter
+> (`agent.kind: claude_code`). It also adds per-issue agent routing via labels
+> (`agent.routing: by_label`) so different issues can be handled by different
+> agents in the same workspace. See `Trackers` and `Agents` below.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
    [Harness engineering](https://openai.com/index/harness-engineering/).
-2. Get a new personal token in Linear via Settings → Security & access → Personal API keys, and
-   set it as the `LINEAR_API_KEY` environment variable.
-3. Copy this directory's `WORKFLOW.md` to your repo.
+2. Pick a tracker and authenticate:
+   - **Linear** — get a personal token via Settings → Security & access → Personal API keys, and
+     set it as `LINEAR_API_KEY`.
+   - **Plane** — create an API token via Workspace settings → API tokens, and set it as
+     `PLANE_API_KEY`. See `.env.example` at the repo root for the full list of variables this
+     fork reads.
+3. Copy this directory's `WORKFLOW.md` to your repo and customize it for your project.
+   - For Linear, get the project slug from the project URL.
+   - For Plane, you need both the workspace slug (from the workspace URL) and the project UUID
+     (`mcp__plane__list_projects` or `https://api.plane.so/api/v1/workspaces/<slug>/projects/`).
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
-     operations such as comment editing or upload flows.
-5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
-     URL.
-   - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
-     Team Settings → Workflow in Linear.
-6. Follow the instructions below to install the required runtime dependencies and start the service.
+     operations such as comment editing or upload flows. There is no equivalent dynamic tool for
+     Plane in this fork; use `curl` from the agent shell or, with Claude Code, the `mcp__plane__*`
+     tools.
+5. Follow the instructions below to install the required runtime dependencies and start the service.
 
 ## Prerequisites
 
@@ -83,7 +93,7 @@ Optional flags:
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
-Minimal example:
+Minimal example (Linear + Codex, upstream defaults):
 
 ```md
 ---
@@ -107,6 +117,41 @@ You are working on a Linear issue {{ issue.identifier }}.
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
 
+Plane + per-issue agent routing example (BHORC fork):
+
+```md
+---
+tracker:
+  kind: plane
+  api_key: $PLANE_API_KEY
+  workspace_slug: my-workspace
+  project_slug: 9f54069d-079b-4f3e-bed6-5c461298a64f
+  active_states: ["Ready for dev"]
+  terminal_states: ["Done", "Cancelled"]
+workspace:
+  root: ~/symphony-workspaces/my-project
+hooks:
+  after_create: |
+    git clone --depth 1 git@github.com:my-org/my-project.git .
+    npm install
+agent:
+  kind: claude_code      # default agent
+  routing: by_label      # tickets with `agent:codex` label override the default
+  max_turns: 8
+codex:
+  command: codex app-server
+claude_code:
+  command: claude
+  permission_mode: acceptEdits
+  max_turns_per_invocation: 30
+---
+
+You are working on issue {{ issue.identifier }}.
+
+Title: {{ issue.title }}
+Body: {{ issue.description }}
+```
+
 Notes:
 
 - If a value is missing, defaults are used.
@@ -127,7 +172,9 @@ Notes:
   `git clone ... .` there, along with any other setup commands you need.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
-- `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- `tracker.api_key` reads from `LINEAR_API_KEY` (kind: linear) or `PLANE_API_KEY` (kind: plane) when
+  the value is unset or written as `$LINEAR_API_KEY` / `$PLANE_API_KEY`. Same fallback applies to
+  `tracker.assignee` via `LINEAR_ASSIGNEE` / `PLANE_ASSIGNEE`.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -150,6 +197,52 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+## Trackers
+
+Symphony selects a tracker adapter based on `tracker.kind` in `WORKFLOW.md`.
+Built-in kinds in this fork:
+
+| `tracker.kind` | Module | Notes |
+|---|---|---|
+| `linear` | `SymphonyElixir.Linear.Adapter` | Upstream default. GraphQL against `https://api.linear.app/graphql`. |
+| `plane` | `SymphonyElixir.Plane.Adapter` | REST against `https://api.plane.so` (configurable via `tracker.endpoint` for self-hosted Plane). Plane requires both `workspace_slug` and `project_slug` (the latter is the project UUID). The public REST API does not honor server-side state filtering on the issue list endpoint, so the adapter paginates fully and filters by state ID client-side. |
+| `memory` | `SymphonyElixir.Tracker.Memory` | In-memory fixture for tests and dry runs. |
+
+## Agents
+
+Symphony selects an agent adapter based on `agent.kind` plus optional
+per-issue routing via `agent.routing`. Built-in kinds in this fork:
+
+| `agent.kind` | Module | Notes |
+|---|---|---|
+| `codex` | `SymphonyElixir.Codex.AppServer` | Upstream default. JSON-RPC over stdio against the Codex app-server protocol. Supports remote workers via SSH. |
+| `claude_code` | `SymphonyElixir.ClaudeCode.AppServer` | Spawns `claude -p <prompt> --output-format stream-json --verbose` and parses each JSONL event. Local-only (no SSH worker support). Authentication is delegated to the host (`claude login`), no API key required. |
+
+### Routing
+
+`agent.routing: fixed` (default) always uses `agent.kind`.
+
+`agent.routing: by_label` looks at the issue's labels for the first one
+matching the case-insensitive pattern `agent:<kind>` (e.g. `agent:codex`,
+`agent:claude_code`) and uses that adapter. If no `agent:*` label is present,
+it falls back to `agent.kind`.
+
+### Registering custom agent adapters
+
+To add a new adapter (Gemini, GLM, custom in-house tool, etc.), implement the
+`SymphonyElixir.Agent` behaviour in your own module and register it via
+application env:
+
+```elixir
+Application.put_env(:symphony_elixir, :agent_adapters, %{
+  "gemini" => MyApp.Gemini.AppServer
+})
+```
+
+This map is merged on top of `SymphonyElixir.Agent.builtin_adapters/0`, so
+runtime overrides win on key collision. After registration the new kind is
+selectable via `agent.kind` or via an `agent:gemini` label.
 
 ## Web dashboard
 
