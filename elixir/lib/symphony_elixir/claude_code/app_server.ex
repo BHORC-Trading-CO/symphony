@@ -26,6 +26,8 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   @default_command "claude"
   @line_chunk_bytes 1_048_576
   @default_turn_timeout_ms 3_600_000
+  @non_json_log_capture 50
+  @non_json_log_line_bytes 4_000
 
   @type session :: %{
           workspace: Path.t(),
@@ -114,6 +116,7 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         :binary,
         :exit_status,
         :hide,
+        :stderr_to_stdout,
         {:line, @line_chunk_bytes},
         {:cd, workspace},
         {:args, args}
@@ -161,7 +164,27 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
         end
 
       {:error, _reason} ->
-        state
+        capture_non_json_line(state, line)
+    end
+  end
+
+  defp capture_non_json_line(state, line) do
+    trimmed = line |> String.trim() |> truncate_line()
+
+    if trimmed == "" do
+      state
+    else
+      existing = Map.get(state, :non_json_lines, [])
+      capped = Enum.take([trimmed | existing], @non_json_log_capture)
+      Map.put(state, :non_json_lines, capped)
+    end
+  end
+
+  defp truncate_line(line) when is_binary(line) do
+    if byte_size(line) > @non_json_log_line_bytes do
+      binary_part(line, 0, @non_json_log_line_bytes) <> "...<truncated>"
+    else
+      line
     end
   end
 
@@ -247,10 +270,20 @@ defmodule SymphonyElixir.ClaudeCode.AppServer do
   defp finalize_turn(state, exit_status) do
     cond do
       exit_status != 0 ->
-        {:error, {:claude_code_exit_nonzero, exit_status, Map.get(state, :result)}}
+        {:error,
+         {:claude_code_exit_nonzero, exit_status,
+          %{
+            result: Map.get(state, :result),
+            captured_output: state |> Map.get(:non_json_lines, []) |> Enum.reverse()
+          }}}
 
       Map.get(state, :is_error, false) == true ->
-        {:error, {:claude_code_turn_error, Map.get(state, :result)}}
+        {:error,
+         {:claude_code_turn_error,
+          %{
+            result: Map.get(state, :result),
+            captured_output: state |> Map.get(:non_json_lines, []) |> Enum.reverse()
+          }}}
 
       true ->
         session_id = Map.get(state, :session_id) || generate_fallback_session_id()
